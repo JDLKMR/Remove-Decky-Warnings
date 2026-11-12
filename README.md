@@ -8,4 +8,4 @@ npm run build
 ```
 
 ## AI disclosure
-All programming was done using Claude. Testing, documentation, and any other writing is all done by me.
+All programming is done using Claude. Testing, documentation, and any other writing is all done by me.

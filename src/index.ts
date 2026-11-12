@@ -10,13 +10,21 @@
 // Both are gated behind a countdown. The custom store one is also opened from
 // inside a component's render body, so it re-opens on every re-render.
 //
-// How this plugin removes them:
-//   1. Wraps SP_JSX.jsx / SP_JSX.jsxs (the JSX runtime Decky's own UI is
-//      compiled against). When an element for the warning dialog is created, its
-//      component is swapped for one that immediately runs the dialog's onOK
-//      handler (exactly what pressing "Continue" does) and closes itself.
-//   2. As a safety net, sets the "warning already accepted" settings so that, even
-//      if the hook above doesn't take effect, the countdown is 0 seconds.
+// How this plugin removes them (several independent layers, because Decky can
+// change how it builds / shows the dialog between releases):
+//   1. Wraps the element factories Decky's UI is compiled against: SP_JSX.jsx /
+//      jsxs / jsxDEV and SP_REACT.createElement. When an element for the warning
+//      dialog is created, its component is swapped for one that immediately runs
+//      the dialog's onOK handler (exactly what pressing "Continue" does) and
+//      closes itself.
+//   2. Wraps DFL.showModal, so if the dialog element reaches showModal it is
+//      accepted without ever being shown (works even if layer 1 is bypassed).
+//   3. As a safety net, sets the "warning already accepted" settings so that, even
+//      if the hooks above don't take effect, the countdown is 0 seconds.
+//
+// Matching is deliberately tolerant: Decky adding or removing props on the dialog
+// must not stop it being recognised. Anything that looks close but doesn't match
+// is listed in the plugin's panel so a miss can be diagnosed.
 
 type AnyFn = (...args: any[]) => any;
 
@@ -30,32 +38,74 @@ const ORIGINAL = '__removeDeckyWarningsOriginal';
 const WARN_TYPE_REPO = 0;
 const WARN_TYPE_ZIP = 1;
 
-// Exactly the props Decky passes to WarnThirdParty (closeModal is injected by showModal).
-const WARN_PROP_KEYS = new Set(['seconds', 'type', 'onOK', 'onCancel', 'closeModal']);
+// Props that mean "this is a generic ConfirmModal", not WarnThirdParty.
+const GENERIC_MODAL_PROPS = ['strTitle', 'strDescription', 'strOKButtonText', 'strCancelButtonText', 'children'];
 
 // Settings that make Decky use a 0 second countdown (the "already accepted" flags).
 const ACCEPTED_SETTINGS = ['developer.warn.third_party', 'store_select.warn.third_party'];
 
+const MAX_UNMATCHED = 5;
+
 const state = {
   active: false,
-  hooked: [] as string[],
+  hooks: [] as string[],
   skipped: 0,
+  unmatched: [] as string[],
   restorers: [] as Array<() => void>,
 };
 
 let repoAccepted = false;
-const replacements = new WeakMap<AnyFn, AnyFn>();
+let rawCreateElement: AnyFn | null = null;
+const replacements = new WeakMap<object, AnyFn>();
 
-/** True if this element is Decky's WarnThirdParty dialog. Kept strict on purpose. */
-function isThirdPartyWarning(type: unknown, props: any): boolean {
-  if (typeof type !== 'function' || props === null || typeof props !== 'object') return false;
-  if (typeof props.seconds !== 'number') return false;
-  if (props.type !== WARN_TYPE_REPO && props.type !== WARN_TYPE_ZIP) return false;
-  if (typeof props.onOK !== 'function' || typeof props.onCancel !== 'function') return false;
-  for (const key in props) {
-    if (!WARN_PROP_KEYS.has(key)) return false;
+function describeProps(props: any): string {
+  try {
+    return Object.keys(props)
+      .map((k) => `${k}:${typeof props[k]}`)
+      .join(',');
+  } catch {
+    return '?';
   }
-  return !(type as any)[MARK];
+}
+
+/** Cheap structural check on the props of an element already known to have type 0/1. */
+function isThirdPartyWarning(props: any): boolean {
+  if (typeof props.onOK !== 'function' || typeof props.onCancel !== 'function') return false;
+  // `seconds` may be a number, or absent if Decky stops passing it.
+  if (props.seconds !== undefined && typeof props.seconds !== 'number') return false;
+  for (const key of GENERIC_MODAL_PROPS) {
+    if (key in props) return false;
+  }
+  return true;
+}
+
+function recordUnmatched(props: any): void {
+  // Only interesting if it has some callback prop, i.e. could plausibly be a dialog.
+  let hasCallback = false;
+  for (const key in props) {
+    if (typeof props[key] === 'function') {
+      hasCallback = true;
+      break;
+    }
+  }
+  if (!hasCallback) return;
+  const signature = describeProps(props);
+  if (state.unmatched.includes(signature) || state.unmatched.length >= MAX_UNMATCHED) return;
+  state.unmatched.push(signature);
+  console.log(TAG, 'dialog-like element did not match:', signature);
+}
+
+/** True if this element is Decky's WarnThirdParty dialog. */
+function inspect(type: unknown, props: any): boolean {
+  if (props === null || typeof props !== 'object') return false;
+  // Fast exit for practically every element in Steam's UI.
+  const kind = props.type;
+  if (kind !== WARN_TYPE_REPO && kind !== WARN_TYPE_ZIP) return false;
+  if (typeof type !== 'function' && (typeof type !== 'object' || type === null)) return false;
+  if ((type as any)[MARK]) return false;
+  if (isThirdPartyWarning(props)) return true;
+  recordUnmatched(props);
+  return false;
 }
 
 function settle(result: unknown): void {
@@ -64,7 +114,7 @@ function settle(result: unknown): void {
   }
 }
 
-/** Do what pressing "Continue" would do, then close the dialog. */
+/** Do what pressing "Continue" would do, then close the dialog (if there is one to close). */
 function acceptNow(props: any): void {
   try {
     if (props.type === WARN_TYPE_REPO) {
@@ -78,19 +128,22 @@ function acceptNow(props: any): void {
       settle(props.onOK());
     }
     state.skipped++;
+    console.log(TAG, `skipped ${props.type === WARN_TYPE_REPO ? 'custom store' : 'ZIP install'} warning`);
   } catch (e) {
     console.error(TAG, 'onOK threw', e);
   } finally {
-    try {
-      props.closeModal();
-    } catch (e) {
-      console.error(TAG, 'closeModal threw', e);
+    if (typeof props.closeModal === 'function') {
+      try {
+        props.closeModal();
+      } catch (e) {
+        console.error(TAG, 'closeModal threw', e);
+      }
     }
   }
 }
 
 /** Component that stands in for WarnThirdParty. Renders nothing and accepts + closes immediately. */
-function getReplacement(original: AnyFn): AnyFn {
+function getReplacement(original: object): AnyFn {
   let component = replacements.get(original);
   if (component) return component;
 
@@ -112,8 +165,9 @@ function getReplacement(original: AnyFn): AnyFn {
     }, []);
 
     // If we can't close the dialog, never leave an empty modal on screen. Show the original
-    // dialog instead, with the countdown at 0 so Continue is available immediately.
-    if (!canClose) return React.createElement(original, { ...props, seconds: 0 });
+    // dialog instead, with the countdown at 0 so Continue is available immediately. This must
+    // bypass our own createElement hook, or it would just be swapped for this component again.
+    if (!canClose) return (rawCreateElement ?? React.createElement)(original, { ...props, seconds: 0 });
     return null;
   };
   (component as any)[MARK] = true;
@@ -136,43 +190,63 @@ function setProp(target: any, name: string, value: unknown): boolean {
   return target[name] === value;
 }
 
-/** Wrap SP_JSX.jsx / SP_JSX.jsxs. Returns the names that were hooked. */
-function hookJsxRuntime(): string[] {
-  const runtime = w.SP_JSX;
-  const hooked: string[] = [];
-  if (!runtime) return hooked;
+/** Wrap an element factory (jsx / jsxs / jsxDEV / createElement): (type, props, ...) => element. */
+function hookFactory(target: any, name: string, label: string): boolean {
+  if (!target) return false;
+  const current = target[name];
+  if (typeof current !== 'function') return false;
 
-  for (const name of ['jsx', 'jsxs']) {
-    const current = runtime[name];
-    if (typeof current !== 'function') continue;
+  // If a stale wrapper from an earlier load is still installed, unwrap it so they don't stack.
+  const base: AnyFn = current[ORIGINAL] ?? current;
 
-    // If a stale wrapper from an earlier load is still installed, unwrap it so they don't stack.
-    const base: AnyFn = current[ORIGINAL] ?? current;
-
-    const wrapped = function (this: unknown, type: unknown, props: any) {
-      if (state.active && typeof props === 'object' && props !== null && typeof props.seconds === 'number') {
-        if (isThirdPartyWarning(type, props)) {
-          const args = Array.prototype.slice.call(arguments);
-          args[0] = getReplacement(type as AnyFn);
-          return base.apply(this, args);
-        }
-      }
-      return base.apply(this, arguments as any);
-    };
-    (wrapped as any)[ORIGINAL] = base;
-
-    if (setProp(runtime, name, wrapped)) {
-      hooked.push(name);
-      state.restorers.push(() => {
-        // Only put the original back if nobody else has wrapped us since.
-        if (runtime[name] === wrapped) setProp(runtime, name, base);
-      });
+  const wrapped = function (this: unknown, type: unknown, props: any) {
+    if (state.active && inspect(type, props)) {
+      const args = Array.prototype.slice.call(arguments);
+      args[0] = getReplacement(type as object);
+      return base.apply(this, args);
     }
-  }
-  return hooked;
+    return base.apply(this, arguments as any);
+  };
+  (wrapped as any)[ORIGINAL] = base;
+
+  if (!setProp(target, name, wrapped)) return false;
+  state.hooks.push(label);
+  state.restorers.push(() => {
+    // Only put the original back if nobody else has wrapped us since.
+    if (target[name] === wrapped) setProp(target, name, base);
+  });
+  return true;
 }
 
-/** Mark both warnings as already accepted so the countdown is 0 even without the hook. */
+/** Wrap DFL.showModal so a warning element is accepted without ever being shown. */
+function hookShowModal(): boolean {
+  const dfl = w.DFL;
+  if (!dfl) return false;
+  const current = dfl.showModal;
+  if (typeof current !== 'function') return false;
+
+  const base: AnyFn = current[ORIGINAL] ?? current;
+
+  const wrapped = function (this: unknown, modal: any) {
+    if (state.active && modal !== null && typeof modal === 'object' && inspect(modal.type, modal.props)) {
+      const props = modal.props;
+      // Never run the handler inside a render pass; Decky can call showModal from one.
+      setTimeout(() => acceptNow({ ...props, closeModal: undefined }), 0);
+      return { Close() {}, Update() {} };
+    }
+    return base.apply(this, arguments as any);
+  };
+  (wrapped as any)[ORIGINAL] = base;
+
+  if (!setProp(dfl, 'showModal', wrapped)) return false;
+  state.hooks.push('DFL.showModal');
+  state.restorers.push(() => {
+    if (dfl.showModal === wrapped) setProp(dfl, 'showModal', base);
+  });
+  return true;
+}
+
+/** Mark both warnings as already accepted so the countdown is 0 even without the hooks. */
 async function seedAcceptedFlags(): Promise<void> {
   const backend = w.DeckyBackend;
   if (!backend || typeof backend.call !== 'function') return;
@@ -197,13 +271,23 @@ function install(): void {
   }
 
   state.active = true;
-  state.hooked = hookJsxRuntime();
+  state.hooks = [];
+  state.unmatched = [];
+
+  // Remember the untouched createElement before hooking it (see getReplacement).
+  const create = w.SP_REACT?.createElement;
+  rawCreateElement = typeof create === 'function' ? create[ORIGINAL] ?? create : null;
+
+  for (const name of ['jsx', 'jsxs', 'jsxDEV']) hookFactory(w.SP_JSX, name, `SP_JSX.${name}`);
+  hookFactory(w.SP_REACT, 'createElement', 'SP_REACT.createElement');
+  hookShowModal();
+
   w.__removeDeckyWarningsRestore = uninstall;
 
-  if (state.hooked.length === 0) {
-    console.warn(TAG, 'could not hook the JSX runtime; only the countdowns are being removed');
+  if (state.hooks.length === 0) {
+    console.warn(TAG, 'could not hook anything; only the countdowns are being removed');
   } else {
-    console.log(TAG, `hooked ${state.hooked.join(', ')}`);
+    console.log(TAG, `hooked ${state.hooks.join(', ')}`);
   }
   void seedAcceptedFlags();
 }
@@ -223,13 +307,10 @@ function uninstall(): void {
 function StatusPanel() {
   const React = w.SP_REACT;
   const { PanelSection, PanelSectionRow } = w.DFL;
-  const hooked = state.hooked.length > 0;
-  return React.createElement(
-    PanelSection,
-    null,
+  const rows = [
     React.createElement(
       PanelSectionRow,
-      null,
+      { key: 'info' },
       React.createElement(
         'div',
         { style: { fontSize: '12px', lineHeight: '1.4' } },
@@ -238,16 +319,33 @@ function StatusPanel() {
     ),
     React.createElement(
       PanelSectionRow,
-      null,
+      { key: 'status' },
       React.createElement(
         'div',
         { style: { fontSize: '12px', opacity: 0.7 } },
-        hooked ? 'Dialog hook: active' : 'Dialog hook: not active (countdown removal only)',
+        state.hooks.length > 0
+          ? `Hooks active: ${state.hooks.join(', ')}`
+          : 'Hooks: none (countdown removal only)',
         React.createElement('br', null),
         `Warnings skipped this session: ${state.skipped}`,
       ),
     ),
-  );
+  ];
+  if (state.unmatched.length > 0) {
+    rows.push(
+      React.createElement(
+        PanelSectionRow,
+        { key: 'unmatched' },
+        React.createElement(
+          'div',
+          { style: { fontSize: '11px', opacity: 0.7, wordBreak: 'break-all' } },
+          'Dialog-like elements that were NOT matched (props):',
+          ...state.unmatched.flatMap((s) => [React.createElement('br', null), s]),
+        ),
+      ),
+    );
+  }
+  return React.createElement(PanelSection, null, ...rows);
 }
 
 function Icon() {
@@ -286,4 +384,4 @@ export default function plugin() {
 }
 
 // Exposed for testing only; Decky only uses the default export.
-export const __internals = { isThirdPartyWarning, getReplacement, acceptNow, hookJsxRuntime, state, install, uninstall };
+export const __internals = { inspect, getReplacement, acceptNow, hookFactory, hookShowModal, state, install, uninstall };
