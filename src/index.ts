@@ -21,6 +21,11 @@
 //      accepted without ever being shown (works even if layer 1 is bypassed).
 //   3. As a safety net, sets the "warning already accepted" settings so that, even
 //      if the hooks above don't take effect, the countdown is 0 seconds.
+//   4. Self-healing: other code (another plugin, Decky itself) can overwrite the
+//      functions hooked in 1 and 2, silently switching the plugin off until it is
+//      reloaded. A watchdog therefore probes the hooks twice a second and
+//      re-installs any that stopped working, and re-applies the settings in 3
+//      every so often. Every repair is recorded and shown in the plugin's panel.
 //
 // Matching is deliberately tolerant: Decky adding or removing props on the dialog
 // must not stop it being recognised. Anything that looks close but doesn't match
@@ -45,14 +50,39 @@ const GENERIC_MODAL_PROPS = ['strTitle', 'strDescription', 'strOKButtonText', 's
 const ACCEPTED_SETTINGS = ['developer.warn.third_party', 'store_select.warn.third_party'];
 
 const MAX_UNMATCHED = 5;
+const MAX_EVENTS = 6;
+const WATCHDOG_MS = 500;
+const RESEED_EVERY_TICKS = 120; // ~60 s
+const MAX_SHOWMODAL_REWRAPS = 5;
 
 const state = {
   active: false,
   hooks: [] as string[],
   skipped: 0,
+  repairs: 0,
+  ticks: 0,
   unmatched: [] as string[],
+  events: [] as string[],
   restorers: [] as Array<() => void>,
+  timer: null as number | null,
 };
+
+interface FactoryDef {
+  label: string;
+  name: string;
+  target: () => any;
+}
+
+// Element factories Decky's UI may be compiled against. Targets are looked up fresh each
+// time, in case a whole global object gets replaced.
+const FACTORIES: FactoryDef[] = [
+  { label: 'SP_JSX.jsx', name: 'jsx', target: () => w.SP_JSX },
+  { label: 'SP_JSX.jsxs', name: 'jsxs', target: () => w.SP_JSX },
+  { label: 'SP_JSX.jsxDEV', name: 'jsxDEV', target: () => w.SP_JSX },
+  { label: 'SP_REACT.createElement', name: 'createElement', target: () => w.SP_REACT },
+];
+
+const showModalHook = { target: null as any, wrapped: null as AnyFn | null, rewraps: 0 };
 
 let repoAccepted = false;
 let rawCreateElement: AnyFn | null = null;
@@ -66,6 +96,19 @@ function describeProps(props: any): string {
   } catch {
     return '?';
   }
+}
+
+function logEvent(message: string): void {
+  const stamp = new Date().toLocaleTimeString();
+  state.events.push(`${stamp} ${message}`);
+  if (state.events.length > MAX_EVENTS) state.events.shift();
+  console.warn(TAG, message);
+}
+
+function setHook(label: string, installed: boolean): void {
+  const index = state.hooks.indexOf(label);
+  if (installed && index === -1) state.hooks.push(label);
+  if (!installed && index !== -1) state.hooks.splice(index, 1);
 }
 
 /** Cheap structural check on the props of an element already known to have type 0/1. */
@@ -191,12 +234,11 @@ function setProp(target: any, name: string, value: unknown): boolean {
 }
 
 /** Wrap an element factory (jsx / jsxs / jsxDEV / createElement): (type, props, ...) => element. */
-function hookFactory(target: any, name: string, label: string): boolean {
-  if (!target) return false;
+function wrapFactory(target: any, name: string): boolean {
   const current = target[name];
   if (typeof current !== 'function') return false;
 
-  // If a stale wrapper from an earlier load is still installed, unwrap it so they don't stack.
+  // Unwrap one of our own earlier wrappers so they don't stack.
   const base: AnyFn = current[ORIGINAL] ?? current;
 
   const wrapped = function (this: unknown, type: unknown, props: any) {
@@ -210,7 +252,6 @@ function hookFactory(target: any, name: string, label: string): boolean {
   (wrapped as any)[ORIGINAL] = base;
 
   if (!setProp(target, name, wrapped)) return false;
-  state.hooks.push(label);
   state.restorers.push(() => {
     // Only put the original back if nobody else has wrapped us since.
     if (target[name] === wrapped) setProp(target, name, base);
@@ -218,15 +259,24 @@ function hookFactory(target: any, name: string, label: string): boolean {
   return true;
 }
 
-/** Wrap DFL.showModal so a warning element is accepted without ever being shown. */
-function hookShowModal(): boolean {
-  const dfl = w.DFL;
-  if (!dfl) return false;
-  const current = dfl.showModal;
-  if (typeof current !== 'function') return false;
+/**
+ * Does this factory (as it is right now, through whatever other wrappers sit on top of us)
+ * still swap warning dialogs? Asked with a throwaway element, so it has no side effects and
+ * works regardless of how many other wrappers are layered around ours.
+ */
+function isFactoryHooked(target: any, name: string): boolean {
+  const probeType = function RemoveDeckyWarningsProbe() {
+    return null;
+  };
+  try {
+    const element = target[name](probeType, { type: WARN_TYPE_ZIP, onOK() {}, onCancel() {} });
+    return !!element && element.type !== probeType;
+  } catch {
+    return true; // can't tell; leave it alone rather than risk stacking wrappers
+  }
+}
 
-  const base: AnyFn = current[ORIGINAL] ?? current;
-
+function makeShowModalWrapper(base: AnyFn): AnyFn {
   const wrapped = function (this: unknown, modal: any) {
     if (state.active && modal !== null && typeof modal === 'object' && inspect(modal.type, modal.props)) {
       const props = modal.props;
@@ -237,27 +287,97 @@ function hookShowModal(): boolean {
     return base.apply(this, arguments as any);
   };
   (wrapped as any)[ORIGINAL] = base;
+  return wrapped;
+}
 
-  if (!setProp(dfl, 'showModal', wrapped)) return false;
-  state.hooks.push('DFL.showModal');
+/** Wrap DFL.showModal so a warning element is accepted without ever being shown. */
+function ensureShowModal(initial: boolean): void {
+  const label = 'DFL.showModal';
+  const dfl = w.DFL;
+  if (!dfl || typeof dfl.showModal !== 'function') {
+    setHook(label, false);
+    return;
+  }
+  if (dfl === showModalHook.target && dfl.showModal === showModalHook.wrapped) {
+    setHook(label, true);
+    return;
+  }
+  // showModal can't be probed safely (a miss would open a real modal), so a foreign
+  // wrapper on top of ours looks like a loss. Cap re-wraps so that can never pile up.
+  if (!initial && showModalHook.rewraps >= MAX_SHOWMODAL_REWRAPS) return;
+
+  const current = dfl.showModal;
+  const base: AnyFn = current[ORIGINAL] ?? current;
+  const wrapped = makeShowModalWrapper(base);
+  if (!setProp(dfl, 'showModal', wrapped)) {
+    setHook(label, false);
+    return;
+  }
+  if (!initial) {
+    showModalHook.rewraps++;
+    state.repairs++;
+    logEvent(`${label} was overwritten; hooked again`);
+  }
+  showModalHook.target = dfl;
+  showModalHook.wrapped = wrapped;
+  setHook(label, true);
   state.restorers.push(() => {
     if (dfl.showModal === wrapped) setProp(dfl, 'showModal', base);
   });
-  return true;
+}
+
+/** Install any hook that is missing, and re-install any that stopped working. */
+function ensureHooks(initial: boolean): void {
+  for (const def of FACTORIES) {
+    const target = def.target();
+    if (!target || typeof target[def.name] !== 'function') {
+      setHook(def.label, false);
+      continue;
+    }
+    if (isFactoryHooked(target, def.name)) {
+      setHook(def.label, true);
+      continue;
+    }
+    const wasInstalled = state.hooks.includes(def.label);
+    if (wrapFactory(target, def.name)) {
+      if (!initial) {
+        if (wasInstalled) state.repairs++;
+        logEvent(wasInstalled ? `${def.label} was overwritten; hooked again` : `${def.label} appeared; hooked`);
+      }
+      setHook(def.label, true);
+    } else {
+      setHook(def.label, false);
+    }
+  }
+  ensureShowModal(initial);
 }
 
 /** Mark both warnings as already accepted so the countdown is 0 even without the hooks. */
-async function seedAcceptedFlags(): Promise<void> {
+async function seedAcceptedFlags(initial: boolean): Promise<void> {
   const backend = w.DeckyBackend;
   if (!backend || typeof backend.call !== 'function') return;
   for (const key of ACCEPTED_SETTINGS) {
     try {
       const current = await backend.call('utilities/settings/get', key, false);
-      if (current !== true) await backend.call('utilities/settings/set', key, true);
+      if (current !== true) {
+        await backend.call('utilities/settings/set', key, true);
+        if (!initial) logEvent(`${key} had been reset; set it again`);
+      }
     } catch (e) {
       console.error(TAG, `could not set ${key}`, e);
     }
   }
+}
+
+function tick(): void {
+  if (!state.active) return;
+  try {
+    ensureHooks(false);
+  } catch (e) {
+    console.error(TAG, 'watchdog error', e);
+  }
+  state.ticks++;
+  if (state.ticks % RESEED_EVERY_TICKS === 0) void seedAcceptedFlags(false);
 }
 
 function install(): void {
@@ -273,27 +393,35 @@ function install(): void {
   state.active = true;
   state.hooks = [];
   state.unmatched = [];
+  state.events = [];
+  state.repairs = 0;
+  state.ticks = 0;
+  showModalHook.target = null;
+  showModalHook.wrapped = null;
+  showModalHook.rewraps = 0;
 
   // Remember the untouched createElement before hooking it (see getReplacement).
   const create = w.SP_REACT?.createElement;
   rawCreateElement = typeof create === 'function' ? create[ORIGINAL] ?? create : null;
 
-  for (const name of ['jsx', 'jsxs', 'jsxDEV']) hookFactory(w.SP_JSX, name, `SP_JSX.${name}`);
-  hookFactory(w.SP_REACT, 'createElement', 'SP_REACT.createElement');
-  hookShowModal();
-
+  ensureHooks(true);
   w.__removeDeckyWarningsRestore = uninstall;
+  state.timer = setInterval(tick, WATCHDOG_MS) as unknown as number;
 
   if (state.hooks.length === 0) {
-    console.warn(TAG, 'could not hook anything; only the countdowns are being removed');
+    console.warn(TAG, 'could not hook anything yet; the watchdog will keep trying. Countdowns are removed regardless.');
   } else {
     console.log(TAG, `hooked ${state.hooks.join(', ')}`);
   }
-  void seedAcceptedFlags();
+  void seedAcceptedFlags(true);
 }
 
 function uninstall(): void {
   state.active = false;
+  if (state.timer !== null) {
+    clearInterval(state.timer);
+    state.timer = null;
+  }
   for (const restore of state.restorers.splice(0)) {
     try {
       restore();
@@ -302,6 +430,7 @@ function uninstall(): void {
     }
   }
   if (w.__removeDeckyWarningsRestore === uninstall) delete w.__removeDeckyWarningsRestore;
+  console.log(TAG, 'uninstalled');
 }
 
 function StatusPanel() {
@@ -328,9 +457,25 @@ function StatusPanel() {
           : 'Hooks: none (countdown removal only)',
         React.createElement('br', null),
         `Warnings skipped this session: ${state.skipped}`,
+        React.createElement('br', null),
+        `Hook repairs this session: ${state.repairs}`,
       ),
     ),
   ];
+  if (state.events.length > 0) {
+    rows.push(
+      React.createElement(
+        PanelSectionRow,
+        { key: 'events' },
+        React.createElement(
+          'div',
+          { style: { fontSize: '11px', opacity: 0.7, wordBreak: 'break-all' } },
+          'Recent events:',
+          ...state.events.flatMap((e) => [React.createElement('br', null), e]),
+        ),
+      ),
+    );
+  }
   if (state.unmatched.length > 0) {
     rows.push(
       React.createElement(
@@ -384,4 +529,4 @@ export default function plugin() {
 }
 
 // Exposed for testing only; Decky only uses the default export.
-export const __internals = { inspect, getReplacement, acceptNow, hookFactory, hookShowModal, state, install, uninstall };
+export const __internals = { inspect, getReplacement, acceptNow, ensureHooks, tick, state, install, uninstall };

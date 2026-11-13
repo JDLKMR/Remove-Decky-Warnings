@@ -1,6 +1,6 @@
 {
   "name": "remove-decky-warnings",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Removes Decky Loader's third-party plugin install warning and custom plugin store warning.",
   "type": "module",
   "scripts": {
